@@ -1,0 +1,3 @@
+/* Inizializzazione di Tailwind CSS v4 */
+/* Utilizziamo l'import diretto che sfrutta il nuovo motore Lightning CSS per build ultra-veloci in locale */
+@import "tailwindcss";
