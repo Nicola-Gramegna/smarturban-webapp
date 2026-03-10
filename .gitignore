@@ -1,0 +1,20 @@
+# Dipendenze Node.js
+node_modules/
+
+# Cartelle di Build e Log
+build/
+dist/
+coverage/
+*.log
+
+# File di Sistema Operativo
+.DS_Store
+
+# Sicurezza (Chiavi API e Configurazioni Locali)
+.env*
+.env.local
+
+# Dati Locali e Media (ESCLUSIONE FONDAMENTALE PER LA TESI)
+*.db
+smarturban.db
+uploads/
