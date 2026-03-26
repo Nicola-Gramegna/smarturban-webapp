@@ -1,6 +1,7 @@
+import express from "express";
+// Inizializzazione sicura delle variabili d'ambiente (Dotenv) prima di ogni altra operazione
 import dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
-import express from "express";
 import { createServer as createViteServer } from "vite";
 import Database from "better-sqlite3";
 import jwt from "jsonwebtoken";
@@ -46,6 +47,7 @@ db.exec(`
     id_stallo TEXT,
     orario_inizio DATETIME,
     orario_fine_stimato DATETIME,
+    orario_fine_effettivo DATETIME,
     importo_base REAL,
     sconto_incentivo REAL,
     importo_finale REAL,
@@ -65,6 +67,13 @@ db.exec(`
     timestamp_creazione DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
+
+// Migrazione dello schema a caldo (Hot Migration) per supportare il check-out anticipato
+try {
+  db.exec("ALTER TABLE Transazione ADD COLUMN orario_fine_effettivo DATETIME");
+} catch (e) {
+  // Column might already exist
+}
 
 // POPOLAMENTO DATI DI BASE (SEEDING)
 // Inserimento dei dati demo per le zone e gli stalli se il DB è vuoto
@@ -198,11 +207,10 @@ if (countZones.count === 0) {
       ]
     }
   ];
-
-// Prepared Statements per ottimizzare l'inserimento massivo
+  // Prepared Statements per ottimizzare l'inserimento massivo
   const insertZona = db.prepare("INSERT INTO Zona_Parcheggio (id_zona, nome_zona, tariffa_base_oraria, capienza_totale_stalli) VALUES (?, ?, ?, ?)");
   const insertStallo = db.prepare("INSERT INTO Stallo (id_stallo, id_zona, latitudine, longitudine, stato) VALUES (?, ?, ?, ?, ?)");
-
+  
   // Transazione Atomica: se un inserimento fallisce, viene fatto il rollback di tutto
   db.transaction(() => {
     for (const zona of seedData) {
@@ -229,7 +237,7 @@ async function startServer() {
   app.use(express.json());
   app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-  
+  // API Routes
 
   // 1 Autenticazione (RBAC - Role Based Access Control)
   app.post("/api/auth/login", (req, res) => {
@@ -241,7 +249,7 @@ async function startServer() {
     let role = "";
     let redirectUrl = "";
 
-    //Assegnazione del ruolo e della route di destinazione in base al dominio email
+    // Assegnazione del ruolo e della route di destinazione in base al dominio email
     if (email.endsWith("@cittadino.it")) {
       role = "CITTADINO";
       redirectUrl = "/mobile-cittadino";
@@ -254,6 +262,7 @@ async function startServer() {
     } else {
       return res.status(401).json({ error: "Dominio non riconosciuto" });
     }
+
     // Generazione del JSON Web Token per gestire la sessione in modo stateless
     const token = jwt.sign({ email, role }, JWT_SECRET, { expiresIn: "1d" });
     res.json({ token, role, redirectUrl });
@@ -263,7 +272,7 @@ async function startServer() {
   app.get("/api/zones", (req, res) => {
     const zones = db.prepare("SELECT * FROM Zona_Parcheggio").all();
     const stalli = db.prepare("SELECT * FROM Stallo").all();
-
+    
     // Unione dei dati relazionali per il frontend
     const zonesWithStalls = zones.map((z) => ({
       ...z,
@@ -273,9 +282,49 @@ async function startServer() {
     res.json(zonesWithStalls);
   });
 
-  //3 Motore di Pagamento e Check-in Sosta
+  // 2b. API Storica per Time Machine (Supporto Decisionale)
+  // Permette di ricostruire lo stato di occupazione degli stalli a una data e ora specifica
+  app.get("/api/zones/history", (req, res) => {
+    const { date, time } = req.query;
+    if (!date || !time) {
+      return res.status(400).json({ error: "Missing date or time parameters" });
+    }
+
+    const targetDateTime = new Date(`${date}T${time}`).toISOString();
+
+    const zones = db.prepare("SELECT * FROM Zona_Parcheggio").all();
+    const stalli = db.prepare("SELECT * FROM Stallo").all();
+    
+    const zonesWithStalls = zones.map((z) => {
+      const stalliForZone = stalli.filter((s) => s.id_zona === z.id_zona);
+      
+      const stalliHistory = stalliForZone.map((stallo) => {
+        const transazione = db.prepare(`
+          SELECT * FROM Transazione 
+          WHERE id_stallo = ? 
+          AND orario_inizio <= ? 
+          AND COALESCE(orario_fine_effettivo, orario_fine_stimato) >= ?
+          ORDER BY orario_inizio DESC LIMIT 1
+        `).get(stallo.id_stallo, targetDateTime, targetDateTime);
+
+        return {
+          ...stallo,
+          stato: transazione ? "OCCUPATO" : "LIBERO"
+        };
+      });
+
+      return {
+        ...z,
+        stalli: stalliHistory
+      };
+    });
+
+    res.json(zonesWithStalls);
+  });
+
+  // 3 Motore di Pagamento e Check-in Sosta
   app.post("/api/parking/checkin", (req, res) => {
-    const { targa, idStallo, durata } = req.body; // durata espressa in ore
+    const { targa, idStallo, durata, hasCrowdsourcingBonus } = req.body; // durata in hours
     if (!targa || !idStallo || !durata) {
       return res.status(400).json({ error: "Missing parameters" });
     }
@@ -289,17 +338,18 @@ async function startServer() {
     }
 
     const zona = db.prepare("SELECT * FROM Zona_Parcheggio WHERE id_zona = ?").get(stallo.id_zona);
-
-    // Logica di Business: Calcolo tariffa con applicazione incentivo Smart
+    
+    // Logica di Business: Calcolo tariffa dinamica con applicazione incentivo Smart e bonus Crowdsourcing (Gamification)
     const importoBase = zona.tariffa_base_oraria * durata;
-    const scontoIncentivo = importoBase * 0.15; // 15% discount
+    const scontoPercentuale = hasCrowdsourcingBonus ? 0.20 : 0.15;
+    const scontoIncentivo = importoBase * scontoPercentuale;
     const importoFinale = importoBase - scontoIncentivo;
 
     const idTransazione = crypto.randomUUID();
     const orarioInizio = new Date();
     const orarioFineStimato = new Date(orarioInizio.getTime() + durata * 60 * 60 * 1000);
 
-    //Transazione per garantire la coerenza tra l'occupazione dello stallo e il pagamento
+    // Transazione per garantire la coerenza tra l'occupazione dello stallo e il pagamento
     db.transaction(() => {
       db.prepare("UPDATE Stallo SET stato = 'OCCUPATO' WHERE id_stallo = ?").run(idStallo);
       db.prepare(`
@@ -314,11 +364,63 @@ async function startServer() {
       importoBase,
       scontoIncentivo,
       importoFinale,
-      message: "Sosta attivata con successo! Sconto incentivo applicato."
+      message: "Sosta attivata con successo!"
     });
   });
 
-  //4 Sistema Segnalazioni (Creazione)
+  // 3b. Check-out Anticipato
+  // Libera lo stallo prima della scadenza naturale e registra l'orario effettivo per analytics
+  app.post("/api/parking/checkout", (req, res) => {
+    const { idStallo, idTransazione } = req.body;
+    
+    if (!idStallo || !idTransazione) {
+      return res.status(400).json({ error: "Missing parameters" });
+    }
+
+    const stallo = db.prepare("SELECT * FROM Stallo WHERE id_stallo = ?").get(idStallo);
+    if (!stallo) return res.status(404).json({ error: "Stallo non trovato" });
+    if (stallo.stato === "LIBERO") return res.status(400).json({ error: "Lo stallo è già libero" });
+
+    db.transaction(() => {
+      db.prepare("UPDATE Stallo SET stato = 'LIBERO' WHERE id_stallo = ?").run(idStallo);
+      db.prepare("UPDATE Transazione SET orario_fine_effettivo = CURRENT_TIMESTAMP WHERE id_transazione = ?").run(idTransazione);
+    })();
+
+    res.json({
+      success: true,
+      message: "Sosta terminata con successo. Lo stallo è ora libero."
+    });
+  });
+
+  // 3c. Sistema di Crowdsourcing: Segnala Stallo Libero
+  // Gli utenti possono segnalare stalli appena liberati per ottenere un bonus sulla sosta successiva
+  app.post("/api/parking/report-free", (req, res) => {
+    const { idStallo } = req.body;
+    
+    if (!idStallo) {
+      return res.status(400).json({ error: "Missing parameters" });
+    }
+
+    const stallo = db.prepare("SELECT * FROM Stallo WHERE id_stallo = ?").get(idStallo);
+    if (!stallo) return res.status(404).json({ error: "Stallo non trovato" });
+    if (stallo.stato === "LIBERO") return res.status(400).json({ error: "Lo stallo risulta già libero nel sistema." });
+
+    db.transaction(() => {
+      db.prepare("UPDATE Stallo SET stato = 'LIBERO' WHERE id_stallo = ?").run(idStallo);
+      db.prepare(`
+        UPDATE Transazione 
+        SET orario_fine_effettivo = CURRENT_TIMESTAMP 
+        WHERE id_stallo = ? AND orario_fine_effettivo IS NULL AND orario_fine_stimato > CURRENT_TIMESTAMP
+      `).run(idStallo);
+    })();
+
+    res.json({
+      success: true,
+      message: "Grazie per il tuo contributo! Lo stallo è stato aggiornato come libero."
+    });
+  });
+
+  // 4 Sistema Segnalazioni (Creazione)
   app.post("/api/reports", upload.single("foto"), (req, res) => {
     const { descrizione, lat, lng } = req.body;
     const fotoUrl = req.file ? `/uploads/${req.file.filename}` : null;
@@ -336,13 +438,13 @@ async function startServer() {
     res.status(201).json({ idSegnalazione, message: "Segnalazione inviata con successo!" });
   });
 
-  //5 Sistema Segnalazioni (Lettura per la Polizia) 
+  // 5 Sistema Segnalazioni (Lettura per la Polizia)
   app.get("/api/reports", (req, res) => {
     const reports = db.prepare("SELECT * FROM Segnalazione ORDER BY timestamp_creazione DESC").all();
     res.json(reports);
   });
 
-  //6 Sistema Segnalazioni (Presa in carico - Lock Optimistico) 
+  // 6 Sistema Segnalazioni (Presa in carico - Lock Optimistico)
   app.post("/api/reports/:id/lock", (req, res) => {
     const { id } = req.params;
     const { idAgente } = req.body;
@@ -420,33 +522,44 @@ async function startServer() {
       // Se Gemini ha deciso di utilizzare il nostro strumento (Function Calling)
       if (response.functionCalls && response.functionCalls.length > 0) {
         const call = response.functionCalls[0];
+
         if (call.name === "getParkingAvailability") {
           const args = call.args || {};
+
           let dbResult = "";
+          
           // Esecuzione query SQL in base alla richiesta formulata da Gemini
           if (args.zona) {
             const zonaName = args.zona.toLowerCase();
+
             const zona = db.prepare("SELECT * FROM Zona_Parcheggio WHERE LOWER(nome_zona) LIKE ?").get(`%${zonaName}%`);
-            
+
             if (zona) {
               const stalliLiberi = db.prepare("SELECT id_stallo FROM Stallo WHERE id_zona = ? AND stato = 'LIBERO'").all(zona.id_zona);
+
               if (stalliLiberi.length > 0) {
                 const ids = stalliLiberi.map(s => s.id_stallo).join(", ");
-                dbResult = `Nella zona ${zona.nome_zona} ci sono ${stalliLiberi.length} stalli liberi. Gli ID degli stalli liberi sono: ${ids}. La tariffa è di ${zona.tariffa_base_oraria}€/h.`;
+
+                dbResult = `Nella zona ${zona.nome_zona} ci sono ${stalliLiberi.length} stalli liberi. Gli ID degli stalli liberi sono: ${ids}.
+                La tariffa è di ${zona.tariffa_base_oraria}€/h.`;
               } else {
                 dbResult = `Purtroppo nella zona ${zona.nome_zona} non ci sono stalli liberi al momento.`;
               }
             } else {
-              dbResult = `Non ho trovato nessuna zona corrispondente a "${args.zona}". Le zone disponibili sono: Murat, Poggiofranco, Carrassi, San Pasquale, Japigia, Libertà, Madonnella.`;
+              dbResult = `Non ho trovato nessuna zona corrispondente a "${args.zona}".
+              Le zone disponibili sono: Murat, Poggiofranco, Carrassi, San Pasquale, Japigia, Libertà, Madonnella.`;
             }
           } else {
             const zones = db.prepare("SELECT * FROM Zona_Parcheggio").all();
+
             const riepilogo = zones.map(z => {
               const liberi = db.prepare("SELECT COUNT(*) as count FROM Stallo WHERE id_zona = ? AND stato = 'LIBERO'").get(z.id_zona).count;
               return `${z.nome_zona}: ${liberi} posti liberi`;
             }).join("\\n");
+
             dbResult = `Riepilogo disponibilità:\\n${riepilogo}`;
           }
+
           // 2° Chiamata a Gemini: Passiamo i dati grezzi estratti dal DB per fargli elaborare una risposta naturale
           const secondResponse = await ai.models.generateContent({
             model: "gemini-3-flash-preview",
@@ -460,15 +573,40 @@ async function startServer() {
               systemInstruction: systemPrompt
             }
           });
-          
+
           replyText = secondResponse.text;
         }
       }
 
       res.json({ reply: replyText });
+
     } catch (error) {
       console.error("AI Error:", error);
+
       res.status(503).json({ error: "L'Assistente AI è momentaneamente sovraccarico. Riprova più tardi." });
+    }
+  });
+
+  // API Export per Amministrazione
+  // Generazione dinamica di dati per il download CSV con filtri temporali
+  app.get("/api/admin/export/transactions", (req, res) => {
+    const { startDate, endDate } = req.query;
+    let query = "SELECT * FROM Transazione";
+    const params = [];
+
+    if (startDate && endDate) {
+      query += " WHERE orario_inizio >= ? AND orario_inizio <= ?";
+      params.push(`${startDate}T00:00:00.000Z`, `${endDate}T23:59:59.999Z`);
+    }
+
+    query += " ORDER BY orario_inizio DESC";
+    
+    try {
+      const transactions = db.prepare(query).all(...params);
+      res.json(transactions);
+    } catch (error) {
+      console.error("Export error:", error);
+      res.status(500).json({ error: "Failed to export transactions" });
     }
   });
 
