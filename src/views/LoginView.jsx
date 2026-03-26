@@ -11,7 +11,6 @@ export default function LoginView() {
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
 
-  //hook per il routing programmatico lato client
   const handleLogin = async (e) => {
     //Preveniamo il ricaricamento naturale del form HTML per gestire tutto tramite fetch asincrona
     e.preventDefault();
